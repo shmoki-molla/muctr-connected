@@ -1,0 +1,87 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: muctr_portfolio_db
+    environment:
+      POSTGRES_USER: portfolio_admin
+      POSTGRES_PASSWORD: local_secret_pass
+      POSTGRES_DB: university_portfolio
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./database/02-auth.sql:/docker-entrypoint-initdb.d/02-auth.sql:ro
+      - ./database/03-dev-auth-seed.sql:/docker-entrypoint-initdb.d/03-dev-auth-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U portfolio_admin -d university_portfolio"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - muctr_network
+
+  minio:
+    image: minio/minio:latest
+    container_name: muctr_portfolio_s3
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - muctr_network
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: muctr_minio_bucket_setup
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set localminio http://minio:9000 minioadmin minioadmin123;
+      /usr/bin/mc mb --ignore-existing localminio/uni-portfolio-bucket;
+      /usr/bin/mc anonymous set private localminio/uni-portfolio-bucket;
+      echo 'Bucket uni-portfolio-bucket is ready';
+      exit 0;
+      "
+    networks:
+      - muctr_network
+
+  api:
+    build:
+      context: ./backend
+    container_name: muctr_drive_api
+    environment:
+      PORT: 8080
+      DATABASE_URL: postgres://portfolio_admin:local_secret_pass@postgres:5432/university_portfolio?sslmode=disable
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - muctr_network
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: muctr_drive_frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - api
+    networks:
+      - muctr_network
+
+volumes:
+  postgres_data:
+  minio_data:
+
+networks:
+  muctr_network:
+    driver: bridge
