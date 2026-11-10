@@ -1,109 +1,102 @@
-# MUCTR Drive: React + Go + PostgreSQL
+# РХТУ Диск — портфолио студентов
 
-## Авторизация: схема и тестовые аккаунты
+React + TypeScript, Go API, PostgreSQL и приватное файловое хранилище MinIO.
 
-Таблицы auth_users и auth_sessions описаны в database/02-auth.sql.
-Тестовые записи для локальной разработки — в database/03-dev-auth-seed.sql.
-При создании нового тома PostgreSQL оба файла выполняются автоматически после init-db.sql.
+## Возможности
+
+- Регистрация студента по email и паролю, вход, выход и сохранение сессии после обновления страницы.
+- Загрузка файла с названием, предметом, типом работы, семестром (осенний/весенний) и учебным годом.
+- Список своих работ, поиск, фильтры, постраничный просмотр, скачивание и удаление.
+- Администратор видит работы всех студентов, скачивает и удаляет их, просматривает студентов, добавляет предметы и удаляет неиспользуемые.
+- Роль проверяется сервером. Зарегистрироваться администратором через публичную форму нельзя.
+- Пароли хранятся как bcrypt-хеши. Сессии — случайные токены в HttpOnly cookie; в БД только SHA-256 хеши. Сессия действует 7 дней.
+- Новому студенту не требуется запись об учебной группе из внешней базы вуза.
+
+## Запуск
+
+Из корня репозитория, где находится этот README:
+
+```powershell
+docker compose up -d --build
+docker compose ps -a
+```
+
+Откройте http://localhost:5173. Health API: http://localhost:8080/api/health.
+MinIO console: http://localhost:9001 (`minioadmin` / `minioadmin123` по умолчанию).
+
+Compose автоматически применяет миграции `02-auth.sql` и `04-portfolio-upload.sql` отдельным сервисом `migrate`, в том числе к существующей базе. Данные остаются в прежних именованных томах. Не используйте `docker compose down -v` для обновления: эта команда удаляет данные.
+
+`minio-init` создаёт приватный bucket и отдельного пользователя API с ограниченными правами на этот bucket. Сервисы `migrate` и `minio-init` после успешного выполнения имеют статус `Exited (0)` — это нормально.
+
+Настройки при необходимости скопируйте из `.env.example` в `.env` до запуска. Изменение `POSTGRES_PASSWORD` в `.env` само по себе не меняет пароль в уже созданной базе.
+
+## Локальные аккаунты
 
 | Роль | Email | Пароль |
 | --- | --- | --- |
 | Администратор | admin@muctr.local | Admin123!dev |
-| Студент Иван Петров | i.petrov@university.local | Student123!dev |
-| Студент Мария Сидорова | m.sidorova@university.local | Student123!dev |
+| Иван Петров | i.petrov@university.local | Student123!dev |
+| Мария Сидорова | m.sidorova@university.local | Student123!dev |
 
-На существующем томе init-скрипты повторно не запускаются. Применить схему и тестовые записи можно без удаления данных:
+У всех одна форма входа; нужный интерфейс выбирается по серверной роли.
+Можно создать своего студента на вкладке «Регистрация».
 
-```bash
-docker compose up -d postgres
-docker compose exec postgres psql -U portfolio_admin -d university_portfolio -f /docker-entrypoint-initdb.d/02-auth.sql
-docker compose exec postgres psql -U portfolio_admin -d university_portfolio -f /docker-entrypoint-initdb.d/03-dev-auth-seed.sql
+Тестовые аккаунты добавляются при `SEED_DEV_ACCOUNTS=true` (по умолчанию для локальной разработки). Повторный запуск не сбрасывает их пароли. Для внешнего стенда отключите seed, замените тестовые учётные данные, настройте HTTPS, `COOKIE_SECURE=true` и точные адреса фронтенда в `APP_ORIGINS`. Отключение seed не удаляет ранее созданные аккаунты. Подтверждение email и восстановление забытого пароля пока не реализованы.
+
+## Файлы и база
+
+Один файл на работу, до 25 МиБ: PDF, DOC/DOCX, XLS/XLSX, PPT/PPTX, TXT/CSV в UTF-8, JPG, PNG и ZIP. Сервер проверяет размер, расширение и формат; файлы выдаются как скачивание. Архивы не распаковываются, антивирусная проверка не подключена.
+
+Владелец работы определяется по сессии, а не по переданному клиентом ID. Ключ объекта генерируется сервером. Доступ к чужим работам для студента запрещён и на скачивание, и на удаление.
+
+Метаданные хранятся в `portfolio_entries`, содержимое — в MinIO. Новые поля: `title`, `academic_year_start`, `storage_status`; связь с историей группы теперь необязательна. Состояния загрузки позволяют скрывать незавершённые операции; обслуживание каждые 15 минут убирает зависшие загрузки/удаления и истёкшие сессии.
+
+Старые записи проверяются на наличие объекта при запуске API. Демонстрационные записи без настоящего файла сохраняются в БД со статусом `missing` и не отображаются как загруженные работы.
+
+Описание API и проверок: [AUTH_TASKS.md](AUTH_TASKS.md).
+
+## Разработка вне Docker
+
+Для инфраструктуры:
+
+```powershell
+docker compose up -d postgres minio
+docker compose run --rm migrate
+docker compose run --rm minio-init
 ```
 
-Это только тестовые учётные данные; перед публикацией стенда замените их. Подробное задание команде — в AUTH_TASKS.md.
+Для API нужен Go 1.25+. В отдельном терминале:
 
-Минимальная связка для демонстрации:
-
-- `frontend/` — React/Vite интерфейс диска.
-- `backend/` — Go API, которое читает данные из PostgreSQL.
-- `database/` — исходная БД: PostgreSQL + MinIO + SQL инициализация.
-- `docker-compose.yml` — запуск всего стека одной командой.
-
-## Быстрый запуск через Docker
-
-```bash
-docker compose up --build
-```
-
-После запуска:
-
-- фронтенд: http://localhost:5173
-- Go API: http://localhost:8080/api/health
-- данные диска: http://localhost:8080/api/drive
-- MinIO console: http://localhost:9001
-
-Логин MinIO: `minioadmin`, пароль: `minioadmin123`.
-
-Если база уже запускалась раньше и тестовые файлы не появились, пересоздай volume:
-
-```bash
-docker compose down -v
-docker compose up --build
-```
-
-## Локальный запуск без Docker для Go/React
-
-1. Поднять только базу:
-
-```bash
-docker compose up postgres minio minio-init
-```
-
-2. Запустить Go API:
-
-```bash
+```powershell
 cd backend
-export DATABASE_URL='postgres://portfolio_admin:local_secret_pass@localhost:5432/university_portfolio?sslmode=disable'
-go mod download
+$env:DATABASE_URL = 'postgres://portfolio_admin:local_secret_pass@localhost:5432/university_portfolio?sslmode=disable'
+$env:S3_ENDPOINT = 'localhost:9000'
+$env:S3_ACCESS_KEY = 'muctr-api'
+$env:S3_SECRET_KEY = 'local_api_secret_123'
 go run .
 ```
 
-3. Запустить фронтенд:
+Для фронтенда нужен Node.js 22.12+:
 
-```bash
+```powershell
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
-Vite проксирует `/api` на `http://localhost:8080`, поэтому в коде фронта можно делать `fetch('/api/drive')`.
+Vite проксирует `/api` на localhost:8080. Одновременно с ним остановите контейнерный frontend, если порт 5173 занят. Go не читает `.env` автоматически.
 
-## Что уже связано
+За nginx ограничение входа учитывает исходный IP только от контейнера `frontend`, заданного через `TRUSTED_PROXY_HOST`. При самостоятельном запуске заголовки прокси по умолчанию не считаются доверенными. Ограничение: 30 попыток регистрации/входа за 15 минут на IP, в памяти одного экземпляра API.
 
-Go API:
+## Проверки
 
-- `GET /api/health` — проверка подключения к PostgreSQL.
-- `GET /api/drive` — папки и файлы для интерфейса.
-- `GET /api/students` — студенты из БД.
-- `GET /api/disciplines` — дисциплины из БД.
-- `POST /api/files` — создание записи файла в `portfolio_entries` без реальной загрузки в MinIO.
+Интеграционные тесты используют отдельные PostgreSQL/MinIO, случайную схему и bucket. Основная база не используется.
 
-Фронтенд теперь сначала пробует загрузить `/api/drive`. Если Go API или PostgreSQL недоступны, интерфейс не падает и показывает демо-данные.
-
-## Пример создания файла через Go API
-
-```bash
-curl -X POST http://localhost:8080/api/files \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "studentId":"f47ac10b-58cc-4372-a567-0e02b2c3d479",
-    "disciplineId":"c1a2b3c4-d5e6-f7a8-b9c0-d1e2f3a4b5c6",
-    "workTypeId":3,
-    "semester":2,
-    "filename":"Новый отчет.pdf",
-    "fileSize":204800,
-    "mimeType":"application/pdf",
-    "grade":"5",
-    "comment":"Добавлено через Go API"
-  }'
+```powershell
+docker compose -p muctr-auth-check -f compose.test.yml run --rm tools
+docker compose -p muctr-auth-check -f compose.test.yml run --rm --no-deps tools go vet ./...
+docker compose -p muctr-auth-check -f compose.test.yml run --rm --no-deps node-tools
+docker compose -p muctr-auth-check -f compose.test.yml down
 ```
+
+Проверяются регистрация, тестовые пароли, роли, cookie, выход и истечение сессии, CORS/защита запросов, ограничение входа, реальные загрузки/скачивание/удаление и изоляция чужих файлов.

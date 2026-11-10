@@ -1,0 +1,46 @@
+services:
+  node-tools:
+    image: node:22-alpine
+    working_dir: /workspace/frontend
+    volumes:
+      - .:/workspace
+      - node_modules:/workspace/frontend/node_modules
+    command: ["sh", "-c", "npm ci && npm run build"]
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: tester
+      POSTGRES_PASSWORD: test-password
+      POSTGRES_DB: portfolio_test
+    tmpfs: ["/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tester -d portfolio_test"]
+      interval: 2s
+      retries: 30
+  minio:
+    image: minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: test-minio
+      MINIO_ROOT_PASSWORD: test-minio-password
+    tmpfs: ["/data"]
+  tools:
+    image: golang:1.25-alpine
+    working_dir: /workspace/backend
+    volumes:
+      - .:/workspace
+      - go_modules:/go/pkg/mod
+      - go_build:/root/.cache/go-build
+    environment:
+      TEST_DATABASE_URL: postgres://tester:test-password@postgres:5432/portfolio_test?sslmode=disable
+      TEST_S3_ENDPOINT: minio:9000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    command: ["go","test","-v","./..."]
+volumes:
+  node_modules:
+  go_modules:
+  go_build:

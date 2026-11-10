@@ -1,87 +1,114 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: muctr_portfolio_db
     environment:
       POSTGRES_USER: portfolio_admin
-      POSTGRES_PASSWORD: local_secret_pass
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_secret_pass}
       POSTGRES_DB: university_portfolio
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./database/init-db.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
-      - ./database/02-auth.sql:/docker-entrypoint-initdb.d/02-auth.sql:ro
-      - ./database/03-dev-auth-seed.sql:/docker-entrypoint-initdb.d/03-dev-auth-seed.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U portfolio_admin -d university_portfolio"]
-      interval: 5s
+      interval: 3s
       timeout: 5s
-      retries: 10
-    networks:
-      - muctr_network
+      retries: 20
 
-  minio:
-    image: minio/minio:latest
-    container_name: muctr_portfolio_s3
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin123
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - minio_data:/data
-    networks:
-      - muctr_network
-
-  minio-init:
-    image: minio/mc:latest
-    container_name: muctr_minio_bucket_setup
-    depends_on:
-      - minio
-    entrypoint: >
-      /bin/sh -c "
-      /usr/bin/mc alias set localminio http://minio:9000 minioadmin minioadmin123;
-      /usr/bin/mc mb --ignore-existing localminio/uni-portfolio-bucket;
-      /usr/bin/mc anonymous set private localminio/uni-portfolio-bucket;
-      echo 'Bucket uni-portfolio-bucket is ready';
-      exit 0;
-      "
-    networks:
-      - muctr_network
-
-  api:
-    build:
-      context: ./backend
-    container_name: muctr_drive_api
-    environment:
-      PORT: 8080
-      DATABASE_URL: postgres://portfolio_admin:local_secret_pass@postgres:5432/university_portfolio?sslmode=disable
-    ports:
-      - "8080:8080"
+  migrate:
+    image: postgres:16-alpine
     depends_on:
       postgres:
         condition: service_healthy
-    networks:
-      - muctr_network
+    environment:
+      PGHOST: postgres
+      PGUSER: portfolio_admin
+      PGPASSWORD: ${POSTGRES_PASSWORD:-local_secret_pass}
+      PGDATABASE: university_portfolio
+      SEED_DEV_ACCOUNTS: ${SEED_DEV_ACCOUNTS:-true}
+    volumes:
+      - ./database:/migrations:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        psql -v ON_ERROR_STOP=1 -f /migrations/02-auth.sql
+        psql -v ON_ERROR_STOP=1 -f /migrations/04-portfolio-upload.sql
+        if [ "$$SEED_DEV_ACCOUNTS" = "true" ]; then
+          psql -v ON_ERROR_STOP=1 -f /migrations/03-dev-auth-seed.sql
+        fi
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    volumes:
+      - minio_data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+      S3_API_USER: ${S3_API_USER:-muctr-api}
+      S3_API_PASSWORD: ${S3_API_PASSWORD:-local_api_secret_123}
+    volumes:
+      - ./infra/minio-policy.json:/policy.json:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        attempts=0
+        until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" && mc ready local; do
+          attempts=$$((attempts+1))
+          [ "$$attempts" -lt 30 ] || exit 1
+          sleep 2
+        done
+        mc mb --ignore-existing local/uni-portfolio-bucket
+        mc anonymous set private local/uni-portfolio-bucket
+        mc admin policy create local muctr-portfolio /policy.json
+        mc admin user add local "$$S3_API_USER" "$$S3_API_PASSWORD"
+        mc admin policy attach local muctr-portfolio --user "$$S3_API_USER"
+
+  api:
+    build: ./backend
+    environment:
+      PORT: "8080"
+      DATABASE_URL: postgres://portfolio_admin:${POSTGRES_PASSWORD:-local_secret_pass}@postgres:5432/university_portfolio?sslmode=disable
+      S3_ENDPOINT: minio:9000
+      S3_ACCESS_KEY: ${S3_API_USER:-muctr-api}
+      S3_SECRET_KEY: ${S3_API_PASSWORD:-local_api_secret_123}
+      S3_BUCKET: uni-portfolio-bucket
+      APP_ORIGINS: ${APP_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      TRUSTED_PROXY_HOST: frontend
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/api/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   frontend:
-    build:
-      context: ./frontend
-    container_name: muctr_drive_frontend
+    build: ./frontend
     ports:
       - "5173:80"
     depends_on:
-      - api
-    networks:
-      - muctr_network
+      api:
+        condition: service_healthy
 
 volumes:
   postgres_data:
   minio_data:
-
-networks:
-  muctr_network:
-    driver: bridge

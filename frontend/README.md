@@ -1,26 +1,16 @@
-# МУЦТР Диск — React интерфейс
+# Интерфейс РХТУ Диска
 
-Интерфейс теперь подключается к Go API по адресу `/api/drive`.
+React + TypeScript + Vite. Регистрация, вход, кабинет студента, загрузка файлов, поиск и фильтры, скачивание/удаление, панель администратора.
 
-## Запуск
-
-```bash
-npm install
+```powershell
+npm ci
 npm run dev
 ```
 
-Vite proxy уже настроен: запросы `/api/*` уходят на `http://localhost:8080`.
+Node.js 22.12+. API должен работать на localhost:8080; Vite проксирует `/api`.
+Сборка: `npm run build`. Полный стек: `docker compose up -d --build` из корня.
 
-## Где подключение
+Основной интерфейс: `src/App.tsx`, стили: `src/styles.css`, API и типы: `src/api/driveApi.ts`.
+Cookie отправляется с запросами автоматически. Токены в localStorage не хранятся. При ошибках API показывается ошибка, демонстрационные данные не используются.
 
-- `src/api/driveApi.ts` — загрузка данных из Go API.
-- `src/App.tsx` — состояние папок/файлов теперь приходит из API; локальные данные используются только как fallback.
-- `vite.config.ts` — proxy для локальной разработки.
-
-## Переменная для внешнего API
-
-Если API не рядом с фронтом, можно задать:
-
-```bash
-VITE_API_URL=http://localhost:8080 npm run dev
-```
+Контракт: [AUTH_TASKS.md](../AUTH_TASKS.md). Аккаунты и запуск: [README.md](../README.md).

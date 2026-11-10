@@ -2,519 +2,263 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"io"
 	"log"
-	"mime"
+	"net"
 	"net/http"
 	"os"
-	"path/filepath"
-	"strconv"
+	"os/signal"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
+const maxUploadBytes int64 = 25 << 20
+const sessionCookie = "muctr_session"
+
 type App struct {
-	db *pgxpool.Pool
+	db               *pgxpool.Pool
+	storage          *minio.Client
+	bucket           string
+	trustedProxyHost string
+	secureCookie     bool
+	origins          map[string]bool
+	limiter          *attemptLimiter
 }
-
-type DriveFolder struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Count int    `json:"count"`
-}
-
-type DriveFile struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Owner    string `json:"owner"`
-	Modified string `json:"modified"`
-	Size     string `json:"size"`
-	Kind     string `json:"kind"`
-	FolderID string `json:"folderId"`
-}
-
-type DriveResponse struct {
-	Folders           []DriveFolder `json:"folders"`
-	Files             []DriveFile   `json:"files"`
-	Source            string        `json:"source"`
-	DatabaseConnected bool          `json:"databaseConnected"`
-	Message           string        `json:"message,omitempty"`
-}
-
-type Student struct {
-	ID             string `json:"id"`
-	FullName       string `json:"fullName"`
-	Email          string `json:"email"`
-	EnrollmentYear int    `json:"enrollmentYear"`
-}
-
-type Discipline struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Faculty     string `json:"faculty"`
-	Description string `json:"description"`
-}
-
-type CreateFileRequest struct {
-	StudentID    string `json:"studentId"`
-	DisciplineID string `json:"disciplineId"`
-	WorkTypeID   int    `json:"workTypeId"`
-	Semester     int    `json:"semester"`
-	Filename     string `json:"filename"`
-	FileSize     int64  `json:"fileSize"`
-	MimeType     string `json:"mimeType"`
-	Grade        string `json:"grade"`
-	Comment      string `json:"comment"`
+type userKey struct{}
+type User struct {
+	ID        string  `json:"id"`
+	Email     string  `json:"email"`
+	Role      string  `json:"role"`
+	StudentID *string `json:"studentId"`
+	FullName  string  `json:"fullName"`
 }
 
 func main() {
-	ctx := context.Background()
-	app := &App{}
-
-	if dsn := strings.TrimSpace(os.Getenv("DATABASE_URL")); dsn != "" {
-		pool, err := pgxpool.New(ctx, dsn)
-		if err != nil {
-			log.Printf("database pool init failed: %v", err)
-		} else {
-			app.db = pool
-			defer pool.Close()
-		}
-	} else {
-		log.Printf("DATABASE_URL is empty; API will return demo fallback data")
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Fatal("DATABASE_URL is required")
 	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /api/health", app.health)
-	mux.HandleFunc("GET /api/drive", app.drive)
-	mux.HandleFunc("GET /api/students", app.students)
-	mux.HandleFunc("GET /api/disciplines", app.disciplines)
-	mux.HandleFunc("POST /api/files", app.createFile)
-
-	staticDir := strings.TrimSpace(os.Getenv("STATIC_DIR"))
-	if staticDir != "" {
-		mux.HandleFunc("/", spaHandler(staticDir))
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		log.Fatal(err)
 	}
-
-	handler := cors(mux)
-	port := env("PORT", "8080")
-	log.Printf("MUCTR Drive API started on :%s", port)
-	if err := http.ListenAndServe(":"+port, handler); err != nil {
+	defer pool.Close()
+	s3, err := minio.New(env("S3_ENDPOINT", "localhost:9000"), &minio.Options{
+		Creds:  credentials.NewStaticV4(env("S3_ACCESS_KEY", "minioadmin"), env("S3_SECRET_KEY", "minioadmin123"), ""),
+		Secure: env("S3_SECURE", "false") == "true",
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	origins := map[string]bool{}
+	for _, origin := range strings.Split(env("APP_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"), ",") {
+		origins[strings.TrimSpace(origin)] = true
+	}
+	app := &App{db: pool, storage: s3, bucket: env("S3_BUCKET", "uni-portfolio-bucket"),
+		trustedProxyHost: os.Getenv("TRUSTED_PROXY_HOST"),
+		secureCookie:     env("COOKIE_SECURE", "false") == "true", origins: origins, limiter: newAttemptLimiter()}
+	startup, cancel := context.WithTimeout(ctx, 30*time.Second)
+	if err := pool.Ping(startup); err != nil {
+		log.Fatal(err)
+	}
+	if exists, err := s3.BucketExists(startup, app.bucket); err != nil || !exists {
+		log.Fatalf("S3 bucket unavailable: %v", err)
+	}
+	app.reconcileStorage(startup)
+	cancel()
+	go app.maintenance(ctx)
+	server := &http.Server{Addr: ":" + env("PORT", "8080"), Handler: app.routes(),
+		ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 3 * time.Minute, WriteTimeout: 3 * time.Minute, IdleTimeout: 60 * time.Second}
+	go func() {
+		<-ctx.Done()
+		shutdown, done := context.WithTimeout(context.Background(), 10*time.Second)
+		defer done()
+		_ = server.Shutdown(shutdown)
+	}()
+	log.Printf("MUCTR API listening on %s", server.Addr)
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 }
 
-func (a *App) health(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-	defer cancel()
-
-	if a.db == nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"ok":       false,
-			"database": "not_configured",
-			"message":  "DATABASE_URL не задан. API работает, но БД не подключена.",
-		})
-		return
-	}
-
-	if err := a.db.Ping(ctx); err != nil {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"ok":       false,
-			"database": "error",
-			"message":  err.Error(),
-		})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":       true,
-		"database": "connected",
-	})
+func (a *App) routes() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/health", a.health)
+	mux.HandleFunc("POST /api/auth/register", a.register)
+	mux.HandleFunc("POST /api/auth/login", a.login)
+	mux.HandleFunc("POST /api/auth/logout", a.logout)
+	mux.Handle("GET /api/me", a.requireUser("", http.HandlerFunc(a.me)))
+	mux.Handle("GET /api/drive", a.requireUser("", http.HandlerFunc(a.drive)))
+	mux.Handle("GET /api/disciplines", a.requireUser("", http.HandlerFunc(a.disciplines)))
+	mux.Handle("GET /api/work-types", a.requireUser("", http.HandlerFunc(a.workTypes)))
+	mux.Handle("POST /api/disciplines", a.requireUser("admin", http.HandlerFunc(a.addDiscipline)))
+	mux.Handle("DELETE /api/disciplines/{id}", a.requireUser("admin", http.HandlerFunc(a.deleteDiscipline)))
+	mux.Handle("GET /api/students", a.requireUser("admin", http.HandlerFunc(a.students)))
+	mux.Handle("POST /api/files", a.requireUser("student", http.HandlerFunc(a.upload)))
+	mux.Handle("GET /api/files/{id}/download", a.requireUser("", http.HandlerFunc(a.download)))
+	mux.Handle("DELETE /api/files/{id}", a.requireUser("", http.HandlerFunc(a.deleteFile)))
+	return a.security(mux)
 }
 
-func (a *App) drive(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
-	defer cancel()
-
-	if a.db == nil {
-		writeJSON(w, http.StatusOK, demoDrive("База не настроена, показаны демо-данные из Go API."))
-		return
-	}
-
-	if err := a.db.Ping(ctx); err != nil {
-		resp := demoDrive("PostgreSQL пока недоступен, показаны демо-данные. Ошибка: " + err.Error())
-		writeJSON(w, http.StatusOK, resp)
-		return
-	}
-
-	folders, err := a.loadFolders(ctx)
-	if err != nil {
-		writeJSON(w, http.StatusOK, demoDrive("Не удалось прочитать папки из БД: "+err.Error()))
-		return
-	}
-
-	files, err := a.loadFiles(ctx)
-	if err != nil {
-		writeJSON(w, http.StatusOK, demoDrive("Не удалось прочитать файлы из БД: "+err.Error()))
-		return
-	}
-
-	writeJSON(w, http.StatusOK, DriveResponse{
-		Folders:           folders,
-		Files:             files,
-		Source:            "postgres",
-		DatabaseConnected: true,
-	})
-}
-
-func (a *App) loadFolders(ctx context.Context) ([]DriveFolder, error) {
-	rows, err := a.db.Query(ctx, `
-        SELECT d.id::text, d.name, COUNT(pe.id)::int AS file_count
-        FROM disciplines d
-        LEFT JOIN portfolio_entries pe ON pe.discipline_id = d.id
-        GROUP BY d.id, d.name
-        ORDER BY d.name
-    `)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var folders []DriveFolder
-	for rows.Next() {
-		var f DriveFolder
-		if err := rows.Scan(&f.ID, &f.Name, &f.Count); err != nil {
-			return nil, err
-		}
-		folders = append(folders, f)
-	}
-	return folders, rows.Err()
-}
-
-func (a *App) loadFiles(ctx context.Context) ([]DriveFile, error) {
-	rows, err := a.db.Query(ctx, `
-        SELECT
-            pe.id::text,
-            d.id::text AS folder_id,
-            pe.original_filename,
-            s.last_name || ' ' || s.first_name || COALESCE(' ' || s.middle_name, '') AS owner,
-            pe.upload_date,
-            COALESCE(pe.file_size, 0),
-            COALESCE(pe.mime_type, '')
-        FROM portfolio_entries pe
-        JOIN students s ON s.id = pe.student_id
-        JOIN disciplines d ON d.id = pe.discipline_id
-        ORDER BY pe.upload_date DESC, pe.original_filename
-    `)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var files []DriveFile
-	for rows.Next() {
-		var id, folderID, name, owner, mimeType string
-		var uploaded time.Time
-		var size int64
-		if err := rows.Scan(&id, &folderID, &name, &owner, &uploaded, &size, &mimeType); err != nil {
-			return nil, err
-		}
-		files = append(files, DriveFile{
-			ID:       id,
-			FolderID: folderID,
-			Name:     name,
-			Owner:    owner,
-			Modified: formatDateRU(uploaded),
-			Size:     formatBytes(size),
-			Kind:     fileKind(name, mimeType),
-		})
-	}
-	return files, rows.Err()
-}
-
-func (a *App) students(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
-	defer cancel()
-
-	if a.db == nil {
-		writeJSON(w, http.StatusOK, []Student{})
-		return
-	}
-
-	rows, err := a.db.Query(ctx, `
-        SELECT id::text, last_name || ' ' || first_name || COALESCE(' ' || middle_name, ''), COALESCE(email, ''), enrollment_year::int
-        FROM students
-        ORDER BY last_name, first_name
-    `)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer rows.Close()
-
-	var students []Student
-	for rows.Next() {
-		var s Student
-		if err := rows.Scan(&s.ID, &s.FullName, &s.Email, &s.EnrollmentYear); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		students = append(students, s)
-	}
-	writeJSON(w, http.StatusOK, students)
-}
-
-func (a *App) disciplines(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
-	defer cancel()
-
-	if a.db == nil {
-		writeJSON(w, http.StatusOK, []Discipline{})
-		return
-	}
-
-	rows, err := a.db.Query(ctx, `
-        SELECT d.id::text, d.name, COALESCE(f.short_name, ''), COALESCE(d.description, '')
-        FROM disciplines d
-        LEFT JOIN faculties f ON f.id = d.faculty_id
-        ORDER BY d.name
-    `)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer rows.Close()
-
-	var disciplines []Discipline
-	for rows.Next() {
-		var d Discipline
-		if err := rows.Scan(&d.ID, &d.Name, &d.Faculty, &d.Description); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		disciplines = append(disciplines, d)
-	}
-	writeJSON(w, http.StatusOK, disciplines)
-}
-
-func (a *App) createFile(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
-	defer cancel()
-
-	if a.db == nil {
-		writeError(w, http.StatusServiceUnavailable, errors.New("DATABASE_URL не задан"))
-		return
-	}
-
-	var req CreateFileRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-
-	req.Filename = strings.TrimSpace(req.Filename)
-	if req.StudentID == "" || req.DisciplineID == "" || req.WorkTypeID == 0 || req.Filename == "" {
-		writeError(w, http.StatusBadRequest, errors.New("нужны studentId, disciplineId, workTypeId и filename"))
-		return
-	}
-	if req.Semester == 0 {
-		req.Semester = 1
-	}
-	if req.MimeType == "" {
-		req.MimeType = mime.TypeByExtension(strings.ToLower(filepath.Ext(req.Filename)))
-	}
-
-	objectKey := fmt.Sprintf("uploads/%s/%s-%s", req.StudentID, randomHex(8), safeFileName(req.Filename))
-
-	var id string
-	err := a.db.QueryRow(ctx, `
-        INSERT INTO portfolio_entries (
-            student_id,
-            student_group_history_id,
-            discipline_id,
-            work_type_id,
-            semester,
-            original_filename,
-            s3_bucket_name,
-            s3_object_key,
-            file_size,
-            mime_type,
-            grade,
-            teacher_comment
-        )
-        SELECT
-            $1::uuid,
-            sgh.id,
-            $2::uuid,
-            $3,
-            $4,
-            $5,
-            'uni-portfolio-bucket',
-            $6,
-            $7,
-            $8,
-            NULLIF($9, ''),
-            NULLIF($10, '')
-        FROM student_group_history sgh
-        WHERE sgh.student_id = $1::uuid
-        ORDER BY sgh.academic_year_start DESC
-        LIMIT 1
-        RETURNING id::text
-    `, req.StudentID, req.DisciplineID, req.WorkTypeID, req.Semester, req.Filename, objectKey, req.FileSize, req.MimeType, req.Grade, req.Comment).Scan(&id)
-
-	if errors.Is(err, pgx.ErrNoRows) {
-		writeError(w, http.StatusBadRequest, errors.New("для студента не найдена история группы"))
-		return
-	}
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	writeJSON(w, http.StatusCreated, map[string]string{"id": id, "s3ObjectKey": objectKey})
-}
-
-func demoDrive(message string) DriveResponse {
-	return DriveResponse{
-		Folders: []DriveFolder{
-			{ID: "demo-db", Name: "Базы данных", Count: 2},
-			{ID: "demo-algo", Name: "Алгоритмы", Count: 1},
-			{ID: "demo-math", Name: "Мат. анализ", Count: 1},
-		},
-		Files: []DriveFile{
-			{ID: "demo-1", FolderID: "demo-db", Name: "Лабораторная работа №1 Базы данных.pdf", Owner: "Петров Иван Сергеевич", Modified: "26 июня 2026", Size: "2,9 МБ", Kind: "pdf"},
-			{ID: "demo-2", FolderID: "demo-db", Name: "SQL запросы и индексы.xlsx", Owner: "Сидорова Мария Александровна", Modified: "25 июня 2026", Size: "420 КБ", Kind: "xlsx"},
-			{ID: "demo-3", FolderID: "demo-algo", Name: "Отчет по сортировкам.docx", Owner: "Петров Иван Сергеевич", Modified: "24 июня 2026", Size: "1,2 МБ", Kind: "docx"},
-			{ID: "demo-4", FolderID: "demo-math", Name: "Графики интегралов.pptx", Owner: "Сидорова Мария Александровна", Modified: "23 июня 2026", Size: "3,1 МБ", Kind: "pptx"},
-		},
-		Source:            "go-fallback",
-		DatabaseConnected: false,
-		Message:           message,
-	}
-}
-
-func writeJSON(w http.ResponseWriter, status int, data any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		log.Printf("json encode error: %v", err)
-	}
-}
-
-func writeError(w http.ResponseWriter, status int, err error) {
-	writeJSON(w, status, map[string]any{"error": err.Error()})
-}
-
-func cors(next http.Handler) http.Handler {
+func (a *App) security(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Cache-Control", "no-store")
 		origin := r.Header.Get("Origin")
 		if origin != "" {
+			if !a.origins[origin] {
+				fail(w, 403, "Источник запроса не разрешён")
+				return
+			}
 			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Vary", "Origin")
-		} else {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Add("Vary", "Origin")
 		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-MUCTR-Request")
+			w.WriteHeader(204)
 			return
+		}
+		if r.Method != "GET" && r.Method != "HEAD" {
+			// Non-simple header + exact Origin allowlist blocks cross-site form/fetch requests.
+			if r.Header.Get("X-MUCTR-Request") != "1" {
+				fail(w, 403, "Отсутствует защитный заголовок запроса")
+				return
+			}
 		}
 		next.ServeHTTP(w, r)
 	})
 }
-
-func spaHandler(dir string) http.HandlerFunc {
-	fs := http.Dir(dir)
-	fileServer := http.FileServer(fs)
-	return func(w http.ResponseWriter, r *http.Request) {
-		path := filepath.Clean(r.URL.Path)
-		if strings.HasPrefix(path, "/api/") {
-			http.NotFound(w, r)
-			return
-		}
-		if path == "/" {
-			fileServer.ServeHTTP(w, r)
-			return
-		}
-		if _, err := os.Stat(filepath.Join(dir, path)); err == nil {
-			fileServer.ServeHTTP(w, r)
-			return
-		}
-		http.ServeFile(w, r, filepath.Join(dir, "index.html"))
+func (a *App) health(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+	if err := a.db.Ping(ctx); err != nil {
+		fail(w, 503, "База данных недоступна")
+		return
+	}
+	exists, err := a.storage.BucketExists(ctx, a.bucket)
+	if err != nil || !exists {
+		fail(w, 503, "Хранилище файлов недоступно")
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"ok": true})
+}
+func currentUser(r *http.Request) User { return r.Context().Value(userKey{}).(User) }
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("response: %v", err)
 	}
 }
-
+func fail(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
+}
+func serverError(w http.ResponseWriter, err error) {
+	log.Printf("request error: %v", err)
+	fail(w, 503, "Не удалось выполнить запрос. Попробуйте ещё раз.")
+}
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
+	if !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		fail(w, 415, "Ожидается JSON")
+		return false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		fail(w, 400, "Некорректные поля запроса")
+		return false
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		fail(w, 400, "Ожидается один JSON-объект")
+		return false
+	}
+	return true
+}
+func constraintError(err error, code string) bool {
+	var e *pgconn.PgError
+	return errors.As(err, &e) && e.Code == code
+}
 func env(key, fallback string) string {
-	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
-		return value
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
 	}
 	return fallback
 }
 
-func formatBytes(size int64) string {
-	if size <= 0 {
-		return "—"
-	}
-	units := []string{"Б", "КБ", "МБ", "ГБ"}
-	value := float64(size)
-	unit := 0
-	for value >= 1024 && unit < len(units)-1 {
-		value /= 1024
-		unit++
-	}
-	if unit == 0 {
-		return strconv.FormatInt(size, 10) + " Б"
-	}
-	return fmt.Sprintf("%.1f %s", value, units[unit])
+type attemptWindow struct {
+	count int
+	until time.Time
+}
+type attemptLimiter struct {
+	mu      sync.Mutex
+	entries map[string]attemptWindow
 }
 
-func formatDateRU(t time.Time) string {
-	months := []string{"января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"}
-	month := months[int(t.Month())-1]
-	return fmt.Sprintf("%d %s %d", t.Day(), month, t.Year())
+func newAttemptLimiter() *attemptLimiter {
+	return &attemptLimiter{entries: make(map[string]attemptWindow)}
 }
-
-func fileKind(name, mimeType string) string {
-	ext := strings.ToLower(filepath.Ext(name))
-	mt := strings.ToLower(mimeType)
-	switch {
-	case ext == ".pdf" || strings.Contains(mt, "pdf"):
-		return "pdf"
-	case ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".gif" || strings.HasPrefix(mt, "image/"):
-		return "image"
-	case ext == ".doc" || ext == ".docx" || strings.Contains(mt, "word"):
-		return "docx"
-	case ext == ".ppt" || ext == ".pptx" || strings.Contains(mt, "presentation"):
-		return "pptx"
-	case ext == ".xls" || ext == ".xlsx" || strings.Contains(mt, "spreadsheet"):
-		return "xlsx"
-	case ext == ".zip" || ext == ".rar" || strings.Contains(mt, "zip"):
-		return "zip"
-	default:
-		return "pdf"
+func (l *attemptLimiter) allow(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	for k, v := range l.entries {
+		if now.After(v.until) {
+			delete(l.entries, k)
+		}
 	}
+	v := l.entries[key]
+	if v.count == 0 {
+		v.until = now.Add(15 * time.Minute)
+	}
+	if v.count >= 30 || len(l.entries) >= 10000 {
+		return false
+	}
+	v.count++
+	l.entries[key] = v
+	return true
 }
-
-func safeFileName(name string) string {
-	name = strings.TrimSpace(filepath.Base(name))
-	if name == "" || name == "." || name == string(filepath.Separator) {
-		return "file"
+func (a *App) clientIP(r *http.Request) string {
+	ip, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		ip = r.RemoteAddr
 	}
-	replacer := strings.NewReplacer("/", "-", "\\", "-", "\x00", "")
-	return replacer.Replace(name)
+	// Trust X-Real-IP only from the configured reverse proxy.
+	// Compose may recreate frontend with a different IP.
+	if a.trustedProxyHost != "" {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+		defer cancel()
+		addresses, err := net.DefaultResolver.LookupIPAddr(ctx, a.trustedProxyHost)
+		if err == nil {
+			for _, address := range addresses {
+				if address.IP.Equal(net.ParseIP(ip)) {
+					if client := net.ParseIP(r.Header.Get("X-Real-IP")); client != nil {
+						return client.String()
+					}
+				}
+			}
+		}
+	}
+	return ip
 }
-
-func randomHex(n int) string {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return strconv.FormatInt(time.Now().UnixNano(), 16)
+func (a *App) allowAuth(w http.ResponseWriter, r *http.Request) bool {
+	if !a.limiter.allow(a.clientIP(r)) {
+		w.Header().Set("Retry-After", "900")
+		fail(w, 429, "Слишком много попыток. Повторите через 15 минут.")
+		return false
 	}
-	return hex.EncodeToString(b)
+	return true
 }
